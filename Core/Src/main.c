@@ -44,8 +44,6 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-volatile uint32_t g_pendsv_cnt = 0;
-
 #define STACK_WORDS 128
 #define STACK_CANARY   0xDEADBEEFu
 
@@ -55,10 +53,12 @@ typedef struct {
   uint32_t state; /* 状态 */
 } tcb_t;
 
-//static uint32_t scratch_stack[64] __attribute__((aligned(8)));
 static uint32_t task_a_stack[STACK_WORDS] __attribute__((aligned(8))); /*GCC/ARMCC 编译器指令**，告诉编译器：**把这个变量（或类型）的内存地址按 8 字节边界对齐*/
+static uint32_t task_b_stack[STACK_WORDS] __attribute__((aligned(8)));
 tcb_t task_a;
+tcb_t task_b;
 tcb_t *g_current;      /* 当前任务的 TCB 指针 */
+tcb_t *g_prev;
 static uint32_t *stack_init(uint32_t *stack_top, void (*entry)(void *), void *arg)
 {
   uint32_t *sp = stack_top;
@@ -93,14 +93,27 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void task_yield(void);
 __attribute__((naked)) void PendSV_Handler(void)
 {
     __asm volatile (
-        "MRS   R0, PSP          \n"   /* 取当前任务的栈指针 */
-        "STMDB R0!, {R4-R11}    \n"   /* 压入 r4-r11，R0 随之下移 32 字节 */
-        "LDMIA R0!, {R4-R11}    \n"   /* 原样取回，R0 回到原处 */
-        "MSR   PSP, R0          \n"
-        "BX    LR               \n"   /* LR = 0xFFFFFFF9，硬件按 MSP 弹帧返回 */
+        /* 1. 把旧任务的 r4-r11 存进它自己的栈顶 */
+        "MOVW  R0, #:lower16:g_prev     \n"
+        "MOVT  R0, #:upper16:g_prev     \n"
+        "LDR   R0, [R0]                 \n"   /* R0 = g_prev (tcb_t*)  */
+        "MRS   R1, PSP                  \n"
+        "STMDB R1!, {R4-R11}            \n"
+        "STR   R1, [R0]                 \n"   /* g_prev->sp = R1       */
+
+        /* 2. 从新任务的栈顶把 r4-r11 装回来 */
+        "MOVW  R2, #:lower16:g_current  \n"
+        "MOVT  R2, #:upper16:g_current  \n"
+        "LDR   R2, [R2]                 \n"   /* R2 = g_current        */
+        "LDR   R1, [R2]                 \n"   /* R1 = next->sp         */
+        "LDMIA R1!, {R4-R11}            \n"
+        "MSR   PSP, R1                  \n"
+        "ORR   LR, LR, #0x0D            \n"
+        "BX    LR                       \n"
     );
 }
 
@@ -120,15 +133,31 @@ __attribute__((naked)) void SVC_Handler(void)
 
 static void task_a_entry(void *arg)
 {
-  char b[64];
-  int  m = snprintf(b, sizeof(b), "task A started, arg=0x%08lX\r\n", (unsigned long)arg);
-  HAL_UART_Transmit(&huart1, (uint8_t *)b, m, HAL_MAX_DELAY);
+  char a[64];
+  int  m;
+  uint32_t cnt = 0;              /* 放在寄存器里，被切走后应该保持 */
 
   while(1) 
   {
-    HAL_Delay(500);
-    m = snprintf(b, sizeof(b), "task A alive, tick=%lu\r\n", (unsigned long)HAL_GetTick());
+    cnt++;
+    m = snprintf(a, sizeof(a), "A:%lu\r\n", (unsigned long)cnt);
+    HAL_UART_Transmit(&huart1, (uint8_t*)a, m, HAL_MAX_DELAY);
+    task_yield();
+  }
+}
+
+static void task_b_entry(void *arg)
+{
+  char b[64];
+  int  m;
+  uint32_t cnt = 0;              /* 放在寄存器里，被切走后应该保持 */
+
+  while (1)
+  {
+    cnt++;
+    m = snprintf(b, sizeof(b), "B:%lu\r\n", (unsigned long)cnt);
     HAL_UART_Transmit(&huart1, (uint8_t*)b, m, HAL_MAX_DELAY);
+    task_yield();
   }
 }
 
@@ -139,6 +168,22 @@ void rtos_start(void)
     __DSB();
     __ISB();
     __asm volatile ("svc 0");    /* 触发 SVC，之后不会返回到这里 */
+}
+
+void task_yield(void)
+{
+  g_prev = g_current;
+  if(g_current == &task_a)
+  {
+    g_current = &task_b;
+  }
+  else
+  {
+    g_current = &task_a;
+  }
+  __asm volatile ("dsb" ::: "memory");
+  __asm volatile ("isb" ::: "memory");
+  (*(volatile uint32_t *)0xE000ED04) = (1u << 28);
 }
 /* USER CODE END 0 */
 
@@ -174,6 +219,7 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   task_a.sp = stack_init(&task_a_stack[STACK_WORDS], task_a_entry, (void *)0x12345678u);
+  task_b.sp = stack_init(&task_b_stack[STACK_WORDS], task_b_entry, (void *)0x87654321u);
 
   NVIC_SetPriority(PendSV_IRQn, 15);
   NVIC_SetPriority(SVCall_IRQn, 15);
