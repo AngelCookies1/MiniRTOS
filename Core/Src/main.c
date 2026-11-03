@@ -164,7 +164,7 @@ static void task_b_entry(void *arg)
 void rtos_start(void)
 {
     g_current = &task_a;
-    __set_PSP(0);
+    __set_PSP(0); //**把 PSP（进程栈指针）寄存器清零**。
     __DSB();
     __ISB();
     __asm volatile ("svc 0");    /* 触发 SVC，之后不会返回到这里 */
