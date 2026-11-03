@@ -47,14 +47,24 @@ UART_HandleTypeDef huart1;
 #define STACK_WORDS 128
 #define STACK_CANARY   0xDEADBEEFu
 
+typedef enum
+{
+  TASK_READY,
+  TASK_DELAYED,
+} task_state_t;
+
+
 typedef struct {
   uint32_t *sp; /* 栈指针，切换时保存/恢复这个 */
   uint32_t prio; /* 优先级 */
-  uint32_t state; /* 状态 */
+  volatile task_state_t state; /* 状态 */
+  volatile uint32_t wake_tick; /* 延时计数 */
 } tcb_t;
 
 static uint32_t task_a_stack[STACK_WORDS] __attribute__((aligned(8))); /*GCC/ARMCC 编译器指令**，告诉编译器：**把这个变量（或类型）的内存地址按 8 字节边界对齐*/
 static uint32_t task_b_stack[STACK_WORDS] __attribute__((aligned(8)));
+static uint32_t idle_stack[64] __attribute__((aligned(8)));
+tcb_t task_idle;
 tcb_t task_a;
 tcb_t task_b;
 tcb_t *g_current;      /* 当前任务的 TCB 指针 */
@@ -81,6 +91,15 @@ static uint32_t *stack_init(uint32_t *stack_top, void (*entry)(void *), void *ar
     *(--sp) = 0;                /* R4  */
     return sp;
 }
+
+static void task_init(tcb_t *t, uint32_t *stack_top, void (*entry)(void *), void *arg, uint32_t prio)
+{
+  t->sp = stack_init(stack_top, entry, arg);
+  t->prio = prio;
+  t->state = TASK_READY;
+  t->wake_tick = 0;
+}
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -93,6 +112,7 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void task_delay(uint32_t ticks);
 void task_yield(void);
 __attribute__((naked)) void PendSV_Handler(void)
 {
@@ -131,6 +151,16 @@ __attribute__((naked)) void SVC_Handler(void)
     );
 }
 
+static void idle_entry(void *arg)
+{
+    (void)arg;
+    while (1)
+    {
+        __WFI();        /* M3 真的停机，等下一个中断 */
+        task_yield();   /* 醒了看看有没有活儿 */
+    }
+}
+
 static void task_a_entry(void *arg)
 {
   char a[64];
@@ -142,7 +172,7 @@ static void task_a_entry(void *arg)
     cnt++;
     m = snprintf(a, sizeof(a), "A:%lu\r\n", (unsigned long)cnt);
     HAL_UART_Transmit(&huart1, (uint8_t*)a, m, HAL_MAX_DELAY);
-    task_yield();
+    task_delay(500);  /* 延迟 1000 个系统节拍 */
   }
 }
 
@@ -157,7 +187,7 @@ static void task_b_entry(void *arg)
     cnt++;
     m = snprintf(b, sizeof(b), "B:%lu\r\n", (unsigned long)cnt);
     HAL_UART_Transmit(&huart1, (uint8_t*)b, m, HAL_MAX_DELAY);
-    task_yield();
+    task_delay(1000);  /* 延迟 1000 个系统节拍 */
   }
 }
 
@@ -170,20 +200,61 @@ void rtos_start(void)
     __asm volatile ("svc 0");    /* 触发 SVC，之后不会返回到这里 */
 }
 
-void task_yield(void)
+static tcb_t *pick_next(void)
 {
-  g_prev = g_current;
+  tcb_t *task[2] = {&task_a, &task_b};
+  int cur;
   if(g_current == &task_a)
   {
-    g_current = &task_b;
+    cur = 0;
   }
   else
   {
-    g_current = &task_a;
+    cur = 1;
   }
+  for(int i = 1; i <= 2; i++)
+  {
+    tcb_t *t = task[(cur + i) % 2];
+    if(t->state == TASK_READY)
+    {
+      return t;
+    }
+  }
+  //return g_current; /* 没有就绪任务，继续运行当前任务 */
+  return &task_idle;
+}
+
+void task_yield(void)
+{
+  tcb_t *next = pick_next();
+  if(next == g_current)
+  {
+    return; /* 没有就绪任务，继续运行当前任务 */
+  }
+  g_prev = g_current;
+  g_current = next;
   __asm volatile ("dsb" ::: "memory");
   __asm volatile ("isb" ::: "memory");
   (*(volatile uint32_t *)0xE000ED04) = (1u << 28);
+}
+
+void task_delay(uint32_t ticks)
+{
+  g_current->wake_tick = HAL_GetTick() + ticks;
+  g_current->state = TASK_DELAYED;
+  task_yield();
+}
+
+void rtos_tick(void)
+{
+  if(task_a.state == TASK_DELAYED && (int32_t)(HAL_GetTick() - task_a.wake_tick) >= 0)
+  {
+    task_a.state = TASK_READY;
+  }
+  if(task_b.state == TASK_DELAYED && (int32_t)(HAL_GetTick() - task_b.wake_tick) >= 0)
+  {
+    task_b.state = TASK_READY;
+  }
 }
 /* USER CODE END 0 */
 
@@ -218,8 +289,9 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  task_a.sp = stack_init(&task_a_stack[STACK_WORDS], task_a_entry, (void *)0x12345678u);
-  task_b.sp = stack_init(&task_b_stack[STACK_WORDS], task_b_entry, (void *)0x87654321u);
+  task_init(&task_idle, &idle_stack[64], idle_entry, NULL, 0);
+  task_init(&task_a, &task_a_stack[STACK_WORDS], task_a_entry, (void *)0x12345678u, 1);
+  task_init(&task_b, &task_b_stack[STACK_WORDS], task_b_entry, (void *)0x87654321u, 1);
 
   NVIC_SetPriority(PendSV_IRQn, 15);
   NVIC_SetPriority(SVCall_IRQn, 15);
