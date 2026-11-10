@@ -18,11 +18,15 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f103xb.h"
+#include "stm32f1xx_hal_gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/_intsup.h>
+#include <sys/_types.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,6 +50,7 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 #define STACK_WORDS 128
 #define STACK_CANARY   0xDEADBEEFu
+#define MAX_TASKS 4
 
 typedef enum
 {
@@ -54,21 +59,29 @@ typedef enum
 } task_state_t;
 
 
-typedef struct {
+typedef struct tcb{
   uint32_t *sp; /* 栈指针，切换时保存/恢复这个 */
   uint32_t prio; /* 优先级 */
   volatile task_state_t state; /* 状态 */
   volatile uint32_t wake_tick; /* 延时计数 */
+
+  struct tcb *delay_next;
 } tcb_t;
 
 static uint32_t task_a_stack[STACK_WORDS] __attribute__((aligned(8))); /*GCC/ARMCC 编译器指令**，告诉编译器：**把这个变量（或类型）的内存地址按 8 字节边界对齐*/
 static uint32_t task_b_stack[STACK_WORDS] __attribute__((aligned(8)));
+static uint32_t task_c_stack[STACK_WORDS] __attribute__((aligned(8)));
 static uint32_t idle_stack[64] __attribute__((aligned(8)));
+static tcb_t *g_tasks[MAX_TASKS];
+static volatile uint32_t test_sink;
+static uint32_t g_task_count;
 tcb_t task_idle;
 tcb_t task_a;
 tcb_t task_b;
+tcb_t task_c;
 tcb_t *g_current;      /* 当前任务的 TCB 指针 */
 tcb_t *g_prev;
+static tcb_t *g_delay_head = NULL;
 static uint32_t *stack_init(uint32_t *stack_top, void (*entry)(void *), void *arg)
 {
   uint32_t *sp = stack_top;
@@ -98,6 +111,7 @@ static void task_init(tcb_t *t, uint32_t *stack_top, void (*entry)(void *), void
   t->prio = prio;
   t->state = TASK_READY;
   t->wake_tick = 0;
+  t->delay_next = NULL;
 }
 
 /* USER CODE END PV */
@@ -112,6 +126,11 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint32_t task_enter_critical(void);
+static void task_exit_critical(uint32_t primask);
+static uint32_t task_index_of_current(void);
+static void delay_list_insert(tcb_t *task);
+static void delay_list_wake(uint32_t now);
 void task_delay(uint32_t ticks);
 void task_yield(void);
 __attribute__((naked)) void PendSV_Handler(void)
@@ -161,33 +180,69 @@ static void idle_entry(void *arg)
     }
 }
 
+// static void task_a_entry(void *arg)
+// {
+//   char a[64];
+//   int  m;
+//   uint32_t cnt = 0;              /* 放在寄存器里，被切走后应该保持 */
+
+//   while(1)
+//   {
+//     cnt++;
+//     m = snprintf(a, sizeof(a), "A:%lu\r\n", (unsigned long)cnt);
+//     HAL_UART_Transmit(&huart1, (uint8_t*)a, m, HAL_MAX_DELAY);
+//     task_delay(500);  /* 延迟 1000 个系统节拍 */
+//   }
+// }
+
 static void task_a_entry(void *arg)
 {
-  char a[64];
-  int  m;
-  uint32_t cnt = 0;              /* 放在寄存器里，被切走后应该保持 */
+    (void)arg;
 
-  while(1) 
-  {
-    cnt++;
-    m = snprintf(a, sizeof(a), "A:%lu\r\n", (unsigned long)cnt);
-    HAL_UART_Transmit(&huart1, (uint8_t*)a, m, HAL_MAX_DELAY);
-    task_delay(500);  /* 延迟 1000 个系统节拍 */
-  }
+    while (1)
+    {
+        uint32_t start = HAL_GetTick();
+
+        while ((uint32_t)(HAL_GetTick() - start) < 200U)
+        {
+            test_sink++;
+        }
+        task_yield();
+    }
 }
+
+// static void task_b_entry(void *arg)
+// {
+//   char b[64];
+//   int  m;
+//   uint32_t cnt = 0;              /* 放在寄存器里，被切走后应该保持 */
+
+//   while (1)
+//   {
+//     cnt++;
+//     m = snprintf(b, sizeof(b), "B:%lu\r\n", (unsigned long)cnt);
+//     HAL_UART_Transmit(&huart1, (uint8_t*)b, m, HAL_MAX_DELAY);
+//     task_delay(1000);  /* 延迟 1000 个系统节拍 */
+//   }
+// }
 
 static void task_b_entry(void *arg)
 {
-  char b[64];
-  int  m;
-  uint32_t cnt = 0;              /* 放在寄存器里，被切走后应该保持 */
+    (void)arg;
 
-  while (1)
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        task_delay(500);
+    }
+}
+
+static void task_c_entry(void *arg)
+{
+  while(1)
   {
-    cnt++;
-    m = snprintf(b, sizeof(b), "B:%lu\r\n", (unsigned long)cnt);
-    HAL_UART_Transmit(&huart1, (uint8_t*)b, m, HAL_MAX_DELAY);
-    task_delay(1000);  /* 延迟 1000 个系统节拍 */
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_0);
+    task_delay(250);
   }
 }
 
@@ -202,58 +257,143 @@ void rtos_start(void)
 
 static tcb_t *pick_next(void)
 {
-  tcb_t *task[2] = {&task_a, &task_b};
-  int cur;
-  if(g_current == &task_a)
+  if(g_task_count == 0)
   {
-    cur = 0;
+    return &task_idle;
   }
-  else
+
+  uint32_t current_index = task_index_of_current();
+  uint32_t highest_prio = 0;
+  uint32_t found = 0;
+
+  //找最高优先级
+  for(uint32_t i = 0; i < g_task_count; i++)
   {
-    cur = 1;
+    tcb_t *t = g_tasks[i];
+    if(t->state != TASK_READY)
+    {
+      continue;
+    }
+
+    if(!found || t->prio > highest_prio)
+    {
+      highest_prio = t->prio;
+      found = 1;
+    }
   }
-  for(int i = 1; i <= 2; i++)
+
+  if(!found)
   {
-    tcb_t *t = task[(cur + i) % 2];
-    if(t->state == TASK_READY)
+    return &task_idle;
+  }
+
+  //找同优先级
+  for(uint32_t offer = 1; offer <= g_task_count; offer++)
+  {
+    uint32_t index = (current_index + offer) % g_task_count;
+    tcb_t *t = g_tasks[index];
+    if(t->state == TASK_READY && t->prio == highest_prio)
     {
       return t;
     }
   }
-  //return g_current; /* 没有就绪任务，继续运行当前任务 */
+
+  if(g_current != NULL && g_current->state == TASK_READY && g_current->prio == highest_prio)
+  {
+    return g_current;
+  }
   return &task_idle;
 }
 
+
 void task_yield(void)
 {
+  uint32_t irq_state = task_enter_critical();
+
   tcb_t *next = pick_next();
-  if(next == g_current)
+  if(next != g_current)
   {
-    return; /* 没有就绪任务，继续运行当前任务 */
+    g_prev = g_current;
+    g_current = next;
+    (*(volatile uint32_t *)0xE000ED04) = (1u << 28);
+    __DSB();
+    __ISB();
   }
-  g_prev = g_current;
-  g_current = next;
-  __asm volatile ("dsb" ::: "memory");
-  __asm volatile ("isb" ::: "memory");
-  (*(volatile uint32_t *)0xE000ED04) = (1u << 28);
+  task_exit_critical(irq_state);
 }
 
 void task_delay(uint32_t ticks)
 {
-  g_current->wake_tick = HAL_GetTick() + ticks;
-  g_current->state = TASK_DELAYED;
-  task_yield();
+  uint32_t irq_state = task_enter_critical();
+  tcb_t *current = g_current;
+  if(current != NULL && current != &task_idle)
+  {
+    current->wake_tick = HAL_GetTick() + ticks;
+    current->state = TASK_DELAYED;
+    delay_list_insert(current);
+    task_yield();
+  }
+  task_exit_critical(irq_state);
 }
 
 void rtos_tick(void)
 {
-  if(task_a.state == TASK_DELAYED && (int32_t)(HAL_GetTick() - task_a.wake_tick) >= 0)
+  uint32_t irq_state = task_enter_critical();
+  uint32_t now = HAL_GetTick();
+
+  delay_list_wake(now);
+  if(g_current != NULL)
   {
-    task_a.state = TASK_READY;
+    task_yield();
   }
-  if(task_b.state == TASK_DELAYED && (int32_t)(HAL_GetTick() - task_b.wake_tick) >= 0)
+  task_exit_critical(irq_state);
+}
+
+static uint32_t task_enter_critical(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  return primask;
+}
+
+static void task_exit_critical(uint32_t primask)
+{
+  __DSB();
+  __ISB();
+  __set_PRIMASK(primask);
+}
+
+static uint32_t task_index_of_current(void)
+{
+  for(uint32_t i = 0; i < g_task_count; i++)
   {
-    task_b.state = TASK_READY;
+    if(g_tasks[i] == g_current)
+    {
+      return i;
+    }
+  }
+  return 0;
+}
+
+static void delay_list_insert(tcb_t *task)
+{
+  tcb_t **link = &g_delay_head;
+  task->delay_next = NULL;
+  while(*link != NULL && (int32_t)((*link)->wake_tick - task->wake_tick) <= 0)
+  {
+    link = &(*link)->delay_next;
+  }
+  task->delay_next = *link;
+  *link = task;
+}
+
+static void delay_list_wake(uint32_t now)
+{
+  while(g_delay_head != NULL && (int32_t)(now - g_delay_head->wake_tick)>= 0)
+  {
+    tcb_t *task = g_delay_head;
+    g_delay_head = task->delay_next;
+    task->state = TASK_READY;
   }
 }
 /* USER CODE END 0 */
@@ -290,8 +430,16 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   task_init(&task_idle, &idle_stack[64], idle_entry, NULL, 0);
-  task_init(&task_a, &task_a_stack[STACK_WORDS], task_a_entry, (void *)0x12345678u, 1);
-  task_init(&task_b, &task_b_stack[STACK_WORDS], task_b_entry, (void *)0x87654321u, 1);
+  task_init(&task_a, &task_a_stack[STACK_WORDS], task_a_entry, NULL, 1);
+  task_init(&task_b, &task_b_stack[STACK_WORDS], task_b_entry, NULL, 2);
+  task_init(&task_c, &task_c_stack[STACK_WORDS], task_c_entry, NULL, 1);
+
+  g_tasks[0] = &task_idle;
+  g_tasks[1] = &task_a;
+  g_tasks[2] = &task_b;
+  g_tasks[3] = &task_c;
+
+  g_task_count = 4;
 
   NVIC_SetPriority(PendSV_IRQn, 15);
   NVIC_SetPriority(SVCall_IRQn, 15);
